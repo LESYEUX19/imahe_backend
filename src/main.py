@@ -25,6 +25,9 @@ user_settings = {
 }
 image_hashes = {}
 
+# Load Haar cascade for eye detection
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+
 # Mount static files for images
 app.mount("/static/images", StaticFiles(directory="src/images"), name="images")
 
@@ -35,7 +38,6 @@ class Settings(BaseModel):
     min_sharpness: float
     
     class Config:
-        # Add example for better API documentation
         schema_extra = {
             "example": {
                 "min_exposure": 50.0,
@@ -51,7 +53,6 @@ class PartialSettings(BaseModel):
     min_sharpness: float = None
     
     class Config:
-        # Add example for better API documentation
         schema_extra = {
             "example": {
                 "min_exposure": 60.0,
@@ -79,9 +80,15 @@ def get_image_hash(image: Image.Image) -> str:
     """Generate perceptual hash for an image."""
     return str(imagehash.average_hash(image))
 
+def detect_closed_eyes(image: np.ndarray) -> bool:
+    """Detect if there are closed eyes in the image."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    eyes = eye_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    return len(eyes) == 0  # If no eyes are detected, we assume closed eyes
+
 @app.post("/upload-image/", response_model=ClassificationResult)
 async def upload_image(file: UploadFile = File(...)):
-    """Upload and classify an image as Good, Bad, or Duplicate."""
+    """Upload and classify an image as Good, Bad, Duplicate, or Closed Eye."""
     try:
         # Read image
         contents = await file.read()
@@ -112,19 +119,27 @@ async def upload_image(file: UploadFile = File(...)):
         # Log sharpness and exposure for debugging
         logger.info(f"Sharpness: {sharpness}, Exposure: {exposure}")
 
-        # Classify image
-        details = {
-            "sharpness": sharpness,
-            "exposure": exposure
-        }
-
-        if (sharpness < user_settings["min_sharpness"] or
-              exposure < user_settings["min_exposure"] or
-              exposure > user_settings["max_exposure"]):
-            label = "Bad"
-            details["reason"] = "Low quality (sharpness or exposure out of range)"
+        # Check for closed eyes
+        if detect_closed_eyes(image):
+            label = "Closed Eye"
+            details = {
+                "sharpness": sharpness,
+                "exposure": exposure
+            }
         else:
-            label = "Good"
+            # Classify image as Good or Bad
+            details = {
+                "sharpness": sharpness,
+                "exposure": exposure
+            }
+
+            if (sharpness < user_settings["min_sharpness"] or
+                  exposure < user_settings["min_exposure"] or
+                  exposure > user_settings["max_exposure"]):
+                label = "Bad"
+                details["reason"] = "Low quality (sharpness or exposure out of range)"
+            else:
+                label = "Good"
 
         return ClassificationResult(
             status="success",
@@ -134,7 +149,11 @@ async def upload_image(file: UploadFile = File(...)):
 
     except Exception as e:
         logger.error(f"Error processing image: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return ClassificationResult(
+            status="error",
+            label="Error",
+            details={"message": str(e)}
+        )
 
 @app.get("/settings/", response_model=Settings)
 async def get_settings():
@@ -209,14 +228,14 @@ async def health_check():
 
 @app.get("/images/organized/")
 async def get_organized_images():
-    """List all images in src/images/ organized as good, bad, or duplicate, with URLs."""
+    """List all images in src/images/ organized as good, bad, duplicate, or closed eye, with URLs."""
     images_dir = os.path.join("src", "images")
     if not os.path.exists(images_dir):
-        return {"good": [], "bad": [], "duplicate": []}
+        return {"good": [], "bad": [], "duplicate": [], "closed_eye": []}
 
     files = glob.glob(os.path.join(images_dir, "*"))
     seen_hashes = set()
-    good, bad, duplicate = [], [], []
+    good, bad, duplicate, closed_eye = [], [], [], []
 
     for file_path in files:
         try:
@@ -252,16 +271,19 @@ async def get_organized_images():
                 "sharpness": sharpness,
                 "exposure": exposure
             }
-            if (sharpness < user_settings["min_sharpness"] or
-                exposure < user_settings["min_exposure"] or
-                exposure > user_settings["max_exposure"]):
+
+            # Check for closed eyes
+            if detect_closed_eyes(image):
+                closed_eye.append(details)
+            elif (sharpness < user_settings["min_sharpness"] or
+                  exposure < user_settings["min_exposure"] or
+                  exposure > user_settings["max_exposure"]):
                 details["reason"] = "Low quality (sharpness or exposure out of range)"
                 bad.append(details)
             else:
                 good.append(details)
         except Exception as e:
             logger.error(f"Error processing {file_path}: {e}")
-            # Optionally, add to a 'failed' list
             continue
 
-    return {"good": good, "bad": bad, "duplicate": duplicate}
+    return {"good": good, "bad": bad, "duplicate": duplicate, "closed_eye": closed_eye}
