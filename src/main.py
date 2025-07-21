@@ -109,6 +109,9 @@ async def upload_image(file: UploadFile = File(...)):
         sharpness = calculate_sharpness(image)
         exposure = calculate_exposure(image)
 
+        # Log sharpness and exposure for debugging
+        logger.info(f"Sharpness: {sharpness}, Exposure: {exposure}")
+
         # Classify image
         details = {
             "sharpness": sharpness,
