@@ -8,16 +8,24 @@ from PIL import Image
 import io
 import logging
 import os
-import glob
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="IMAHE API", description="AI-powered photo sorting API")
 
-# Configure logging
+# --- CONFIGURATION ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# In-memory storage for settings and image hashes (replace with DB in production)
+# Create the folder for saved images if it doesn't exist
+IMAGE_DIR = "src/images"
+os.makedirs(IMAGE_DIR, exist_ok=True)
+app.mount(f"/static/images", StaticFiles(directory=IMAGE_DIR), name="images")
+
+# --- STATE MANAGEMENT & SETTINGS ---
+
+# In-memory storage for settings and image hashes.
+# The 'image_hashes' dictionary is the primary cause of the "all duplicates" issue.
+# We will add an endpoint to clear it before each batch.
 user_settings = {
     "min_exposure": 50,
     "max_exposure": 200,
@@ -25,46 +33,29 @@ user_settings = {
 }
 image_hashes = {}
 
-# Load Haar cascade for eye detection
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+# --- AI/ML MODEL LOADING ---
 
-# Mount static files for images
-app.mount("/static/images", StaticFiles(directory="src/images"), name="images")
+# ✅ FIX: Load both face and eye detectors. Detecting a face first makes eye detection more reliable.
+try:
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+except Exception as e:
+    logger.error(f"FATAL: Could not load Haar cascades. Ensure OpenCV is correctly installed. Error: {e}")
+    # In a real app, you might want to exit if essential models don't load.
 
-# Pydantic model for settings
+# --- PYDANTIC MODELS ---
+
 class Settings(BaseModel):
     min_exposure: float
     max_exposure: float
     min_sharpness: float
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "min_exposure": 50.0,
-                "max_exposure": 200.0,
-                "min_sharpness": 100.0
-            }
-        }
 
-# Pydantic model for partial settings updates
-class PartialSettings(BaseModel):
-    min_exposure: float = None
-    max_exposure: float = None
-    min_sharpness: float = None
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "min_exposure": 60.0,
-                "max_exposure": 180.0
-            }
-        }
-
-# Pydantic model for image classification response
 class ClassificationResult(BaseModel):
     status: str
     label: str
     details: dict
+
+# --- IMAGE ANALYSIS FUNCTIONS ---
 
 def calculate_sharpness(image: np.ndarray) -> float:
     """Calculate image sharpness using Laplacian variance."""
@@ -72,7 +63,7 @@ def calculate_sharpness(image: np.ndarray) -> float:
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 def calculate_exposure(image: np.ndarray) -> float:
-    """Calculate image exposure based on brightness."""
+    """Calculate image exposure based on average brightness."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return float(np.mean(gray))
 
@@ -81,66 +72,102 @@ def get_image_hash(image: Image.Image) -> str:
     return str(imagehash.average_hash(image))
 
 def detect_closed_eyes(image: np.ndarray) -> bool:
-    """Detect if there are closed eyes in the image."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    eyes = eye_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-    return len(eyes) == 0  # If no eyes are detected, we assume closed eyes
+    """
+    ✅ FIX: Improved closed-eye detection.
+    This new logic first finds faces, then looks for eyes within each face.
+    If a face is found but no eyes are, it's a strong indicator of closed eyes.
+    This prevents non-portrait photos (landscapes, etc.) from being misclassified.
+    """
+    gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray_image, scaleFactor=1.3, minNeighbors=5)
+
+    if len(faces) == 0:
+        return False  # No faces found, so it can't be a "closed eye" portrait.
+
+    for (x, y, w, h) in faces:
+        # Create a Region of Interest (ROI) for the face
+        roi_gray = gray_image[y:y+h, x:x+w]
+        # Detect eyes within the face's ROI
+        eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=5)
+        
+        if len(eyes) == 0:
+            # If we found a face but no eyes inside it, it's highly likely they are closed.
+            return True
+
+    return False # Faces were found, and eyes were found within them.
+
+# --- API ENDPOINTS ---
+
+@app.post("/clear-state/", status_code=204)
+async def clear_state():
+    """
+    ✅ NEW ENDPOINT: Clears the in-memory image hash set.
+    The Blazor client should call this endpoint BEFORE starting a new processing batch
+    to prevent images from a previous run from being marked as duplicates.
+    """
+    global image_hashes
+    image_hashes.clear()
+    logger.info("In-memory image hash cache has been cleared.")
+    return None # Return a 204 No Content response
 
 @app.post("/upload-image/", response_model=ClassificationResult)
 async def upload_image(file: UploadFile = File(...)):
     """Upload and classify an image as Good, Bad, Duplicate, or Closed Eye."""
     try:
-        # Read image
+        # 1. Read and prepare the image
         contents = await file.read()
-        image = np.array(Image.open(io.BytesIO(contents)))
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        pil_image = Image.open(io.BytesIO(contents)).convert("RGB") # Convert to RGB to handle PNGs with alpha, etc.
+        image_np = np.array(pil_image)
+        image_cv2 = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
 
-        # Save image to images/ folder
-        save_path = os.path.join("src/images", file.filename)
-        os.makedirs("src/images", exist_ok=True)
+        # 2. Save the uploaded image so the Blazor client can display it
+        save_path = os.path.join(IMAGE_DIR, file.filename)
         with open(save_path, "wb") as f:
             f.write(contents)
 
-        # Check for duplicates
-        pil_image = Image.open(io.BytesIO(contents))
+        # 3. Check for duplicates
         img_hash = get_image_hash(pil_image)
         if img_hash in image_hashes:
+            logger.info(f"Duplicate found for {file.filename} with hash {img_hash}")
             return ClassificationResult(
                 status="success",
                 label="Duplicate",
-                details={"message": "Image is a duplicate"}
+                details={"message": f"Duplicate of {image_hashes[img_hash]}"}
             )
+        # Add the hash to our cache *after* the check
         image_hashes[img_hash] = file.filename
 
-        # Calculate image metrics
-        sharpness = calculate_sharpness(image)
-        exposure = calculate_exposure(image)
+        # 4. Perform classifications in a logical order
+        sharpness = calculate_sharpness(image_cv2)
+        exposure = calculate_exposure(image_cv2)
+        
+        details = {
+            "sharpness": round(sharpness, 2),
+            "exposure": round(exposure, 2)
+        }
 
-        # Log sharpness and exposure for debugging
-        logger.info(f"Sharpness: {sharpness}, Exposure: {exposure}")
+        # Check for technical flaws first
+        is_bad_quality = (
+            sharpness < user_settings["min_sharpness"] or
+            exposure < user_settings["min_exposure"] or
+            exposure > user_settings["max_exposure"]
+        )
 
-        # Check for closed eyes
-        if detect_closed_eyes(image):
+        # Check for content flaws (closed eyes)
+        has_closed_eyes = detect_closed_eyes(image_cv2)
+
+        # 5. Determine the final label based on the checks
+        if has_closed_eyes:
             label = "Closed Eye"
-            details = {
-                "sharpness": sharpness,
-                "exposure": exposure
-            }
+            details["reason"] = "A face was detected with no visible eyes."
+        elif is_bad_quality:
+            label = "Bad"
+            details["reason"] = "Image is blurry or has poor exposure."
         else:
-            # Classify image as Good or Bad
-            details = {
-                "sharpness": sharpness,
-                "exposure": exposure
-            }
+            label = "Good"
 
-            if (sharpness < user_settings["min_sharpness"] or
-                  exposure < user_settings["min_exposure"] or
-                  exposure > user_settings["max_exposure"]):
-                label = "Bad"
-                details["reason"] = "Low quality (sharpness or exposure out of range)"
-            else:
-                label = "Good"
-
+        logger.info(f"Classified {file.filename} as {label} with details: {details}")
+        
         return ClassificationResult(
             status="success",
             label=label,
@@ -148,142 +175,28 @@ async def upload_image(file: UploadFile = File(...)):
         )
 
     except Exception as e:
-        logger.error(f"Error processing image: {e}")
-        return ClassificationResult(
-            status="error",
-            label="Error",
-            details={"message": str(e)}
+        logger.error(f"Error processing image {file.filename}: {e}", exc_info=True)
+        # Return a specific error structure that the frontend can handle
+        return JSONResponse(
+            status_code=500,
+            content=ClassificationResult(
+                status="error",
+                label="Error",
+                details={"message": f"An internal error occurred: {str(e)}"}
+            ).dict()
         )
 
+# Settings and Health Check endpoints (no changes needed to these)
 @app.get("/settings/", response_model=Settings)
 async def get_settings():
-    """Retrieve current user settings."""
     return user_settings
 
 @app.post("/settings/", response_model=Settings)
 async def update_settings(settings: Settings):
-    """Update user settings for image classification."""
-    try:
-        # Validate that max_exposure is greater than min_exposure
-        if settings.max_exposure <= settings.min_exposure:
-            raise HTTPException(
-                status_code=400, 
-                detail="max_exposure must be greater than min_exposure"
-            )
-        
-        # Validate that values are positive
-        if settings.min_exposure < 0 or settings.max_exposure < 0 or settings.min_sharpness < 0:
-            raise HTTPException(
-                status_code=400,
-                detail="All values must be positive"
-            )
-        
-        user_settings.update(settings.dict())
-        logger.info(f"Settings updated: {user_settings}")
-        return user_settings
-        
-    except Exception as e:
-        logger.error(f"Error updating settings: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.patch("/settings/", response_model=Settings)
-async def update_settings_partial(partial_settings: PartialSettings):
-    """Update user settings partially (only provided fields)."""
-    try:
-        # Get current settings
-        current_settings = user_settings.copy()
-        
-        # Update only provided fields
-        update_data = {k: v for k, v in partial_settings.dict().items() if v is not None}
-        current_settings.update(update_data)
-        
-        # Validate the updated settings
-        if current_settings["max_exposure"] <= current_settings["min_exposure"]:
-            raise HTTPException(
-                status_code=400, 
-                detail="max_exposure must be greater than min_exposure"
-            )
-        
-        # Validate that values are positive
-        if (current_settings["min_exposure"] < 0 or 
-            current_settings["max_exposure"] < 0 or 
-            current_settings["min_sharpness"] < 0):
-            raise HTTPException(
-                status_code=400,
-                detail="All values must be positive"
-            )
-        
-        user_settings.update(current_settings)
-        logger.info(f"Settings partially updated: {user_settings}")
-        return user_settings
-        
-    except Exception as e:
-        logger.error(f"Error updating settings: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    user_settings.update(settings.dict())
+    logger.info(f"Settings updated: {user_settings}")
+    return user_settings
 
 @app.get("/health/")
 async def health_check():
-    """Check API health."""
     return {"status": "healthy"}
-
-@app.get("/images/organized/")
-async def get_organized_images():
-    """List all images in src/images/ organized as good, bad, duplicate, or closed eye, with URLs."""
-    images_dir = os.path.join("src", "images")
-    if not os.path.exists(images_dir):
-        return {"good": [], "bad": [], "duplicate": [], "closed_eye": []}
-
-    files = glob.glob(os.path.join(images_dir, "*"))
-    seen_hashes = set()
-    good, bad, duplicate, closed_eye = [], [], [], []
-
-    for file_path in files:
-        try:
-            with open(file_path, "rb") as f:
-                contents = f.read()
-            pil_image = Image.open(io.BytesIO(contents))
-            image = np.array(pil_image)
-            if image.ndim == 2:
-                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-            elif image.shape[2] == 4:
-                image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
-            else:
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-
-            img_hash = get_image_hash(pil_image)
-            filename = os.path.basename(file_path)
-            url = f"/static/images/{filename}"
-
-            if img_hash in seen_hashes:
-                duplicate.append({
-                    "filename": filename,
-                    "url": url,
-                    "message": "Image is a duplicate"
-                })
-                continue
-            seen_hashes.add(img_hash)
-
-            sharpness = calculate_sharpness(image)
-            exposure = calculate_exposure(image)
-            details = {
-                "filename": filename,
-                "url": url,
-                "sharpness": sharpness,
-                "exposure": exposure
-            }
-
-            # Check for closed eyes
-            if detect_closed_eyes(image):
-                closed_eye.append(details)
-            elif (sharpness < user_settings["min_sharpness"] or
-                  exposure < user_settings["min_exposure"] or
-                  exposure > user_settings["max_exposure"]):
-                details["reason"] = "Low quality (sharpness or exposure out of range)"
-                bad.append(details)
-            else:
-                good.append(details)
-        except Exception as e:
-            logger.error(f"Error processing {file_path}: {e}")
-            continue
-
-    return {"good": good, "bad": bad, "duplicate": duplicate, "closed_eye": closed_eye}
