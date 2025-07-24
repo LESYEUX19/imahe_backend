@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 import imagehash
 from PIL import Image
-import io
+import io # Required for in-memory byte handling
 import logging
 import os
 from fastapi.staticfiles import StaticFiles
@@ -16,16 +16,14 @@ app = FastAPI(title="IMAHE API", description="AI-powered photo sorting API")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create the folder for saved images if it doesn't exist
 IMAGE_DIR = "src/images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 app.mount(f"/static/images", StaticFiles(directory=IMAGE_DIR), name="images")
 
-# --- STATE MANAGEMENT & SETTINGS ---
+# --- NEW: Define a max size for faster processing ---
+MAX_PROCESSING_SIZE = (1280, 720) # (Width, Height) - Balances speed and accuracy
 
-# In-memory storage for settings and image hashes.
-# The 'image_hashes' dictionary is the primary cause of the "all duplicates" issue.
-# We will add an endpoint to clear it before each batch.
+# --- STATE MANAGEMENT & SETTINGS ---
 user_settings = {
     "min_exposure": 50,
     "max_exposure": 200,
@@ -34,17 +32,13 @@ user_settings = {
 image_hashes = {}
 
 # --- AI/ML MODEL LOADING ---
-
-# ✅ FIX: Load both face and eye detectors. Detecting a face first makes eye detection more reliable.
 try:
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 except Exception as e:
-    logger.error(f"FATAL: Could not load Haar cascades. Ensure OpenCV is correctly installed. Error: {e}")
-    # In a real app, you might want to exit if essential models don't load.
+    logger.error(f"FATAL: Could not load Haar cascades. Error: {e}")
 
-# --- PYDANTIC MODELS ---
-
+# --- PYDANTIC MODELS (No changes needed) ---
 class Settings(BaseModel):
     min_exposure: float
     max_exposure: float
@@ -55,108 +49,102 @@ class ClassificationResult(BaseModel):
     label: str
     details: dict
 
-# --- IMAGE ANALYSIS FUNCTIONS ---
-
+# --- IMAGE ANALYSIS FUNCTIONS (No changes needed) ---
 def calculate_sharpness(image: np.ndarray) -> float:
-    """Calculate image sharpness using Laplacian variance."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 def calculate_exposure(image: np.ndarray) -> float:
-    """Calculate image exposure based on average brightness."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return float(np.mean(gray))
 
 def get_image_hash(image: Image.Image) -> str:
-    """Generate perceptual hash for an image."""
     return str(imagehash.average_hash(image))
 
 def detect_closed_eyes(image: np.ndarray) -> bool:
-    """
-    ✅ FIX: Improved closed-eye detection.
-    This new logic first finds faces, then looks for eyes within each face.
-    If a face is found but no eyes are, it's a strong indicator of closed eyes.
-    This prevents non-portrait photos (landscapes, etc.) from being misclassified.
-    """
     gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray_image, scaleFactor=1.3, minNeighbors=5)
 
     if len(faces) == 0:
-        return False  # No faces found, so it can't be a "closed eye" portrait.
+        return False
 
     for (x, y, w, h) in faces:
-        # Create a Region of Interest (ROI) for the face
         roi_gray = gray_image[y:y+h, x:x+w]
-        # Detect eyes within the face's ROI
         eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=5)
         
         if len(eyes) == 0:
-            # If we found a face but no eyes inside it, it's highly likely they are closed.
             return True
 
-    return False # Faces were found, and eyes were found within them.
+    return False
 
 # --- API ENDPOINTS ---
 
 @app.post("/clear-state/", status_code=204)
 async def clear_state():
     """
-    ✅ NEW ENDPOINT: Clears the in-memory image hash set.
-    The Blazor client should call this endpoint BEFORE starting a new processing batch
-    to prevent images from a previous run from being marked as duplicates.
+    Clears the in-memory image hash set. Call before starting a new batch.
+    NOTE: When using multiple workers (Gunicorn), this clears the cache for whichever
+    worker receives the request. This is an acceptable trade-off for simplicity.
     """
     global image_hashes
     image_hashes.clear()
     logger.info("In-memory image hash cache has been cleared.")
-    return None # Return a 204 No Content response
+    return None
 
 @app.post("/upload-image/", response_model=ClassificationResult)
 async def upload_image(file: UploadFile = File(...)):
-    """Upload and classify an image as Good, Bad, Duplicate, or Closed Eye."""
+    """Upload, resize for speed, and classify an image."""
     try:
-        # 1. Read and prepare the image
+        # 1. Read image bytes
         contents = await file.read()
-        pil_image = Image.open(io.BytesIO(contents)).convert("RGB") # Convert to RGB to handle PNGs with alpha, etc.
-        image_np = np.array(pil_image)
-        image_cv2 = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
 
-        # 2. Save the uploaded image so the Blazor client can display it
+        # 2. Save the ORIGINAL full-quality image for the UI to display
         save_path = os.path.join(IMAGE_DIR, file.filename)
         with open(save_path, "wb") as f:
             f.write(contents)
 
-        # 3. Check for duplicates
-        img_hash = get_image_hash(pil_image)
+        # === START: NEW HIGH-SPEED RESIZING LOGIC ===
+        pil_image = Image.open(io.BytesIO(contents)).convert("RGB")
+        
+        # Create a copy for resizing, leaving the original pil_image if needed
+        pil_image_for_processing = pil_image.copy()
+        
+        # Resize the image if it's larger than our max size
+        pil_image_for_processing.thumbnail(MAX_PROCESSING_SIZE, Image.Resampling.LANCZOS)
+        
+        # Convert the resized PIL image to the OpenCV format needed for analysis
+        image_cv2_resized = cv2.cvtColor(np.array(pil_image_for_processing), cv2.COLOR_RGB2BGR)
+        # === END: NEW HIGH-SPEED RESIZING LOGIC ===
+
+
+        # 3. Check for duplicates using the resized image (it's faster)
+        img_hash = get_image_hash(pil_image_for_processing)
         if img_hash in image_hashes:
-            logger.info(f"Duplicate found for {file.filename} with hash {img_hash}")
+            logger.info(f"Duplicate found for {file.filename}")
             return ClassificationResult(
                 status="success",
                 label="Duplicate",
-                details={"message": f"Duplicate of {image_hashes[img_hash]}"}
+                details={"message": f"Duplicate of {image_hashes.get(img_hash, 'unknown')}"}
             )
-        # Add the hash to our cache *after* the check
         image_hashes[img_hash] = file.filename
 
-        # 4. Perform classifications in a logical order
-        sharpness = calculate_sharpness(image_cv2)
-        exposure = calculate_exposure(image_cv2)
+        # 4. Perform all classifications on the SMALLER, RESIZED image
+        sharpness = calculate_sharpness(image_cv2_resized)
+        exposure = calculate_exposure(image_cv2_resized)
+        has_closed_eyes = detect_closed_eyes(image_cv2_resized)
         
         details = {
             "sharpness": round(sharpness, 2),
             "exposure": round(exposure, 2)
         }
 
-        # Check for technical flaws first
         is_bad_quality = (
             sharpness < user_settings["min_sharpness"] or
             exposure < user_settings["min_exposure"] or
             exposure > user_settings["max_exposure"]
         )
 
-        # Check for content flaws (closed eyes)
-        has_closed_eyes = detect_closed_eyes(image_cv2)
-
-        # 5. Determine the final label based on the checks
+        # 5. Determine the final label
         if has_closed_eyes:
             label = "Closed Eye"
             details["reason"] = "A face was detected with no visible eyes."
@@ -166,7 +154,7 @@ async def upload_image(file: UploadFile = File(...)):
         else:
             label = "Good"
 
-        logger.info(f"Classified {file.filename} as {label} with details: {details}")
+        logger.info(f"Classified {file.filename} as {label}")
         
         return ClassificationResult(
             status="success",
@@ -176,7 +164,6 @@ async def upload_image(file: UploadFile = File(...)):
 
     except Exception as e:
         logger.error(f"Error processing image {file.filename}: {e}", exc_info=True)
-        # Return a specific error structure that the frontend can handle
         return JSONResponse(
             status_code=500,
             content=ClassificationResult(
@@ -186,7 +173,7 @@ async def upload_image(file: UploadFile = File(...)):
             ).dict()
         )
 
-# Settings and Health Check endpoints (no changes needed to these)
+# Settings and Health Check endpoints (no changes needed)
 @app.get("/settings/", response_model=Settings)
 async def get_settings():
     return user_settings
