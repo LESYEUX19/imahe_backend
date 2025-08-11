@@ -1,7 +1,8 @@
 fastapi
 uvicorn[standard]
-pydantic
+python-multipart
 opencv-python
-numpy
+dlib
 imagehash
-Pillow
+scipy
+cmake
