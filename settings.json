@@ -1,0 +1,10 @@
+{
+    "min_exposure": 50.0,
+    "max_exposure": 200.0,
+    "min_sharpness": 100.0,
+    "focused_ratio": 1.75,
+    "very_sharp_threshold": 250.0,
+    "eye_aspect_ratio": 0.25,
+    "closed_eye_percentage": 0.5,
+    "duplicate_hash_distance": 5
+}

@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field, ConfigDict
 import cv2
 import numpy as np
 from PIL import Image, UnidentifiedImageError
-import io, logging, os, sqlite3, datetime, re, uuid
+import io, logging, os, sqlite3, datetime, re, uuid, json
 from typing import List, Optional, Dict
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
@@ -36,35 +36,56 @@ else:
     dnn_face_detector = cv2.dnn.readNetFromCaffe(PROTOTXT_PATH, MODEL_PATH)
     logger.info("AI Models loaded successfully at startup.")
 
-user_settings = { "min_sharpness": 100.0, "focused_ratio": 1.75, "very_sharp_threshold": 250.0, "eye_aspect_ratio": 0.25, "closed_eye_percentage": 0.5 }
+SETTINGS_FILE = os.path.join(SCRIPT_DIR, "..", "settings.json")
+DEFAULT_SETTINGS = {
+    "min_exposure": 50.0,
+    "max_exposure": 200.0,
+    "min_sharpness": 100.0,
+    "focused_ratio": 1.75,
+    "very_sharp_threshold": 250.0,
+    "eye_aspect_ratio": 0.25,
+    "closed_eye_percentage": 0.5,
+    "duplicate_hash_distance": 5
+}
+
+def save_settings_to_file(settings_dict):
+    with open(SETTINGS_FILE, 'w') as f: json.dump(settings_dict, f, indent=4)
+    logger.info(f"Settings saved to {SETTINGS_FILE}")
+
+def load_settings_from_file():
+    if not os.path.exists(SETTINGS_FILE):
+        save_settings_to_file(DEFAULT_SETTINGS)
+        return DEFAULT_SETTINGS
+    try:
+        with open(SETTINGS_FILE, 'r') as f:
+            settings = json.load(f)
+            for key, value in DEFAULT_SETTINGS.items(): settings.setdefault(key, value)
+            return settings
+    except (json.JSONDecodeError, IOError):
+        logger.error(f"Could not read {SETTINGS_FILE}, falling back to defaults."); save_settings_to_file(DEFAULT_SETTINGS); return DEFAULT_SETTINGS
+
+user_settings = load_settings_from_file()
 session_hashes: Dict[imagehash.ImageHash, str] = {}
 
 class ClassificationDetails(BaseModel): model_config = ConfigDict(populate_by_name=True); message: Optional[str] = None; exposure: Optional[float] = None; sharpness: Optional[float] = None; face_count: Optional[int] = Field(default=None, alias="faceCount"); is_duplicate: bool = Field(default=False, alias="isDuplicate"); has_closed_eyes: bool = Field(default=False, alias="hasClosedEyes")
 class ClassificationResult(BaseModel): label: str; details: ClassificationDetails
 class UploadResponse(BaseModel): model_config = ConfigDict(populate_by_name=True); classification: ClassificationResult; sanitized_filename: str = Field(..., alias="sanitizedFilename"); image_url: str = Field(..., alias="imageUrl")
-class SettingsModel(BaseModel): min_sharpness: float; focused_ratio: float; very_sharp_threshold: float; eye_aspect_ratio: float; closed_eye_percentage: float
+class SettingsModel(BaseModel):
+    min_exposure: float
+    max_exposure: float
+    min_sharpness: float
 class UpdateHistoryLabelRequest(BaseModel): path: str; newLabel: str; newDetailsMessage: str
 
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL,
-                filename TEXT NOT NULL,
-                label TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                details_message TEXT,
-                path TEXT NOT NULL UNIQUE,
-                sharpness REAL,
-                exposure REAL
-            )
-        """)
+        cursor.execute("CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, filename TEXT NOT NULL, label TEXT NOT NULL, timestamp TEXT NOT NULL, details_message TEXT, path TEXT NOT NULL UNIQUE, sharpness REAL, exposure REAL)")
     logger.info("Database initialized.")
 
 @app.on_event("startup")
 async def on_startup():
+    global user_settings
+    user_settings = load_settings_from_file()
     init_db()
 
 def eye_aspect_ratio(eye): A = dist.euclidean(eye[1], eye[5]); B = dist.euclidean(eye[2], eye[4]); C = dist.euclidean(eye[0], eye[3]); return (A + B) / (2.0 * C)
@@ -99,26 +120,28 @@ def classify_image_logic(image_pil: Image.Image, image_cv2: np.ndarray, original
     try:
         phash = imagehash.phash(image_pil)
         if phash in session_hashes:
-            return "Duplicate", ClassificationDetails(is_duplicate=True, message=f"Duplicate of: {session_hashes[phash]}"), None
+            return "Duplicate", ClassificationDetails(is_duplicate=True, message=f"Duplicate of: {session_hashes[phash]}")
         session_hashes[phash] = original_filename
     except Exception as e:
         logger.warning(f"Could not calculate image hash for {original_filename}: {e}")
     image_cv2_small = _resize_for_analysis(image_cv2); gray_image_small = cv2.cvtColor(image_cv2_small, cv2.COLOR_BGR2GRAY); exposure = float(np.mean(cv2.cvtColor(image_cv2, cv2.COLOR_BGR2GRAY))); overall_sharpness = calculate_sharpness(image_cv2_small)
+    if exposure < settings['min_exposure'] or exposure > settings['max_exposure']:
+        return "Bad", ClassificationDetails(exposure=round(exposure, 2), message="Image is too dark or too bright.")
     face_analysis = analyze_faces_hybrid(image_cv2_small, settings["eye_aspect_ratio"]); face_count = face_analysis["count"]
     if face_count > 0 and face_analysis["closed_eye_count"] / face_count >= settings["closed_eye_percentage"]:
         msg = "A person may have closed eyes."
-        return "Closed Eye", ClassificationDetails(has_closed_eyes=True, face_count=face_count, exposure=round(exposure, 2), message=msg), None
+        return "Closed Eye", ClassificationDetails(has_closed_eyes=True, face_count=face_count, exposure=round(exposure, 2), message=msg)
     if face_count > 0:
         face_sharpness_scores = [calculate_sharpness(roi) for roi in face_analysis["face_rois"]]
-        if not face_sharpness_scores: return "Good", ClassificationDetails(face_count=face_count, exposure=round(exposure, 2), message="Face detected but sharpness could not be analyzed."), None
+        if not face_sharpness_scores: return "Good", ClassificationDetails(face_count=face_count, exposure=round(exposure, 2), message="Face detected but sharpness could not be analyzed.")
         max_face_sharpness = max(face_sharpness_scores); is_very_sharp = max_face_sharpness > settings["very_sharp_threshold"]; has_high_ratio = overall_sharpness > 0 and (max_face_sharpness / overall_sharpness) > settings["focused_ratio"]
-        if is_very_sharp and has_high_ratio: return "Focused", ClassificationDetails(sharpness=round(max_face_sharpness, 2), face_count=face_count, exposure=round(exposure, 2), message="Subject is well-focused against the background."), None
-        if max_face_sharpness < settings["min_sharpness"]: return "Blurred", ClassificationDetails(sharpness=round(max_face_sharpness, 2), face_count=face_count, exposure=round(exposure, 2), message="The main subject appears to be blurry."), None
-        return "Good", ClassificationDetails(sharpness=round(np.mean(face_sharpness_scores), 2), face_count=face_count, exposure=round(exposure, 2), message="Image is good."), None
+        if is_very_sharp and has_high_ratio: return "Focused", ClassificationDetails(sharpness=round(max_face_sharpness, 2), face_count=face_count, exposure=round(exposure, 2), message="Subject is well-focused against the background.")
+        if max_face_sharpness < settings["min_sharpness"]: return "Blurred", ClassificationDetails(sharpness=round(max_face_sharpness, 2), face_count=face_count, exposure=round(exposure, 2), message="The main subject appears to be blurry.")
+        return "Good", ClassificationDetails(sharpness=round(np.mean(face_sharpness_scores), 2), face_count=face_count, exposure=round(exposure, 2), message="Image is good.")
     else:
-        if is_line_art_or_graphic(gray_image_small): return "Good", ClassificationDetails(sharpness=0, face_count=0, exposure=round(exposure, 2), message="Image detected as a graphic or line art."), None
-        if overall_sharpness < settings["min_sharpness"]: return "Blurred", ClassificationDetails(sharpness=round(overall_sharpness, 2), face_count=0, exposure=round(exposure, 2), message="The image appears to be blurry."), None
-        return "Good", ClassificationDetails(sharpness=round(overall_sharpness, 2), face_count=0, exposure=round(exposure, 2), message="Image is good."), None
+        if is_line_art_or_graphic(gray_image_small): return "Good", ClassificationDetails(sharpness=0, face_count=0, exposure=round(exposure, 2), message="Image detected as a graphic or line art.")
+        if overall_sharpness < settings["min_sharpness"]: return "Blurred", ClassificationDetails(sharpness=round(overall_sharpness, 2), face_count=0, exposure=round(exposure, 2), message="The image appears to be blurry.")
+        return "Good", ClassificationDetails(sharpness=round(overall_sharpness, 2), face_count=0, exposure=round(exposure, 2), message="Image is good.")
 
 @app.post("/upload-image/", response_model=UploadResponse)
 async def upload_image(session_id: str = Form(...), file: UploadFile = File(...)):
@@ -129,7 +152,7 @@ async def upload_image(session_id: str = Form(...), file: UploadFile = File(...)
         label = "Unreadable"; details = ClassificationDetails(message=f"File '{original_filename}' is corrupted or not a valid image format.")
         return UploadResponse(classification=ClassificationResult(label=label, details=details), sanitized_filename=safe_filename, image_url="")
     try:
-        label, details, _ = classify_image_logic(image_pil, image_cv2, original_filename, user_settings)
+        label, details = classify_image_logic(image_pil, image_cv2, original_filename, user_settings)
         if label == "Duplicate":
             return UploadResponse(classification=ClassificationResult(label=label, details=details), sanitized_filename=original_filename, image_url="")
         file_extension = os.path.splitext(safe_filename)[1]; unique_history_filename = f"{uuid.uuid4()}{file_extension}"
@@ -152,12 +175,22 @@ async def clear_state():
     return {"message": "Session duplicate cache cleared successfully"}
 
 @app.get("/settings", response_model=SettingsModel)
-async def get_settings(): return user_settings
+async def get_settings():
+    return user_settings
+
 @app.post("/settings")
-async def update_settings(new_settings: SettingsModel): user_settings.update(new_settings.dict()); return {"message": "Settings updated"}
+async def update_settings(new_settings: SettingsModel):
+    global user_settings
+    for key, value in new_settings.dict().items():
+        if key in user_settings:
+            user_settings[key] = value
+    save_settings_to_file(user_settings)
+    return {"message": "Settings updated successfully"}
+
 @app.put("/update-history-label/")
 async def update_history_label(request: UpdateHistoryLabelRequest):
     try:
+        # --- THE FIX IS HERE ---
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE history SET label = ?, details_message = ? WHERE path = ?", (request.newLabel, request.newDetailsMessage, request.path))
@@ -179,24 +212,16 @@ async def get_history():
         logger.error(f"Could not retrieve history: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to retrieve history.")
 
-# --- THE FIX IS HERE ---
 @app.delete("/history")
 async def clear_history():
     try:
-        # Step 1: Safely delete all records from the history table.
         with sqlite3.connect(DB_FILE) as conn:
             conn.execute("DELETE FROM history")
             conn.commit()
         logger.info("Cleared all records from the history database.")
-
-        # Step 2: Delete all the physical image files.
-        logger.info("Clearing all permanent history images from static/history_images folder.")
         for f in os.listdir(HISTORY_IMAGES_DIR):
-            try:
-                os.remove(os.path.join(HISTORY_IMAGES_DIR, f))
-            except OSError as e:
-                logger.error(f"Error removing history file {f}: {e}")
-        
+            try: os.remove(os.path.join(HISTORY_IMAGES_DIR, f))
+            except OSError as e: logger.error(f"Error removing history file {f}: {e}")
         return JSONResponse(status_code=200, content={"message": "History and all permanent images cleared successfully."})
     except Exception as e:
         logger.error(f"Failed to clear history: {e}", exc_info=True)
