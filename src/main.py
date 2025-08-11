@@ -149,7 +149,7 @@ async def upload_image(session_id: str = Form(...), file: UploadFile = File(...)
     contents = await file.read()
     try: image_pil = Image.open(io.BytesIO(contents)).convert("RGB"); image_cv2 = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     except UnidentifiedImageError:
-        label = "Unreadable"; details = ClassificationDetails(message=f"File '{original_filename}' is corrupted or not a valid image format.")
+        label = "Unreadable"; details = ClassificationDetails(message=f"File '{original_filename}' is corrupted.")
         return UploadResponse(classification=ClassificationResult(label=label, details=details), sanitized_filename=safe_filename, image_url="")
     try:
         label, details = classify_image_logic(image_pil, image_cv2, original_filename, user_settings)
@@ -165,7 +165,7 @@ async def upload_image(session_id: str = Form(...), file: UploadFile = File(...)
         return UploadResponse(classification=ClassificationResult(label=label, details=details), sanitized_filename=safe_filename, image_url=permanent_web_path)
     except Exception as e:
         logger.error(f"Error in CLASSIFICATION logic for {file.filename}: {e}", exc_info=True)
-        label = "Error"; details = ClassificationDetails(message=f"Backend analysis failed for this image. See console for details.")
+        label = "Error"; details = ClassificationDetails(message=f"Backend analysis failed. See console for details.")
         return UploadResponse(classification=ClassificationResult(label=label, details=details), sanitized_filename=safe_filename, image_url="")
 
 @app.post("/clear-state/")
@@ -181,16 +181,14 @@ async def get_settings():
 @app.post("/settings")
 async def update_settings(new_settings: SettingsModel):
     global user_settings
-    for key, value in new_settings.dict().items():
-        if key in user_settings:
-            user_settings[key] = value
+    update_data = new_settings.dict(exclude_unset=True)
+    user_settings.update(update_data)
     save_settings_to_file(user_settings)
     return {"message": "Settings updated successfully"}
 
 @app.put("/update-history-label/")
 async def update_history_label(request: UpdateHistoryLabelRequest):
     try:
-        # --- THE FIX IS HERE ---
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE history SET label = ?, details_message = ? WHERE path = ?", (request.newLabel, request.newDetailsMessage, request.path))
@@ -200,6 +198,7 @@ async def update_history_label(request: UpdateHistoryLabelRequest):
         return {"message": "History label updated successfully"}
     except Exception as e: logger.error(f"DATABASE ERROR on update: {e}", exc_info=True); raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
 
+# --- THE FIX IS HERE: RESTORED THE FULL WORKING LOGIC ---
 @app.get("/history", response_model=List[Dict])
 async def get_history():
     if not os.path.exists(DB_FILE): return []
@@ -210,8 +209,11 @@ async def get_history():
             return [dict(row) for row in rows]
     except Exception as e:
         logger.error(f"Could not retrieve history: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to retrieve history.")
+        # We must raise an exception here so FastAPI reports the error,
+        # otherwise it will return None and cause a validation error.
+        raise HTTPException(status_code=500, detail="Failed to retrieve history from database.")
 
+# --- THE FIX IS HERE: RESTORED THE FULL WORKING LOGIC ---
 @app.delete("/history")
 async def clear_history():
     try:

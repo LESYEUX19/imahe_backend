@@ -5,4 +5,3 @@ opencv-python
 dlib
 imagehash
 scipy
-cmake
