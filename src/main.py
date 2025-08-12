@@ -126,11 +126,8 @@ def classify_image_logic(image_pil: Image.Image, image_cv2: np.ndarray, original
     except Exception as e:
         logger.warning(f"Could not calculate image hash for {original_filename}: {e}")
     image_cv2_small = _resize_for_analysis(image_cv2); gray_image_small = cv2.cvtColor(image_cv2_small, cv2.COLOR_BGR2GRAY); exposure = float(np.mean(cv2.cvtColor(image_cv2, cv2.COLOR_BGR2GRAY))); overall_sharpness = calculate_sharpness(image_cv2_small)
-    
-    # --- THIS IS THE CRITICAL CHANGE ---
     if exposure < settings['min_exposure'] or exposure > settings['max_exposure']:
         return "Poor Quality", ClassificationDetails(exposure=round(exposure, 2), message="Image is too dark or too bright.")
-        
     face_analysis = analyze_faces_hybrid(image_cv2_small, settings["eye_aspect_ratio"]); face_count = face_analysis["count"]
     if face_count > 0 and face_analysis["closed_eye_count"] / face_count >= settings["closed_eye_percentage"]:
         msg = "Eyes Closed Detected: Please Review"
@@ -157,8 +154,11 @@ async def upload_image(session_id: str = Form(...), file: UploadFile = File(...)
         return UploadResponse(classification=ClassificationResult(label=label, details=details), sanitized_filename=safe_filename, image_url="")
     try:
         label, details = classify_image_logic(image_pil, image_cv2, original_filename, user_settings)
-        if label == "Duplicate":
-            return UploadResponse(classification=ClassificationResult(label=label, details=details), sanitized_filename=original_filename, image_url="")
+        
+        # --- THE FIX IS HERE: The early return for "Duplicate" has been removed ---
+        # The old 'if label == "Duplicate": return ...' block was here. It's now gone.
+        
+        # All classifications, including Duplicates, will now proceed to this logic.
         file_extension = os.path.splitext(safe_filename)[1]; unique_history_filename = f"{uuid.uuid4()}{file_extension}"
         permanent_disk_path = os.path.join(HISTORY_IMAGES_DIR, unique_history_filename); permanent_web_path = os.path.join("static", "history_images", unique_history_filename).replace("\\", "/")
         with open(permanent_disk_path, "wb") as f: f.write(contents)
