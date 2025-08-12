@@ -1,3 +1,4 @@
+# main.py - FULL CORRECTED CODE
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ConfigDict
@@ -125,11 +126,14 @@ def classify_image_logic(image_pil: Image.Image, image_cv2: np.ndarray, original
     except Exception as e:
         logger.warning(f"Could not calculate image hash for {original_filename}: {e}")
     image_cv2_small = _resize_for_analysis(image_cv2); gray_image_small = cv2.cvtColor(image_cv2_small, cv2.COLOR_BGR2GRAY); exposure = float(np.mean(cv2.cvtColor(image_cv2, cv2.COLOR_BGR2GRAY))); overall_sharpness = calculate_sharpness(image_cv2_small)
+    
+    # --- THIS IS THE CRITICAL CHANGE ---
     if exposure < settings['min_exposure'] or exposure > settings['max_exposure']:
-        return "Bad", ClassificationDetails(exposure=round(exposure, 2), message="Image is too dark or too bright.")
+        return "Poor Quality", ClassificationDetails(exposure=round(exposure, 2), message="Image is too dark or too bright.")
+        
     face_analysis = analyze_faces_hybrid(image_cv2_small, settings["eye_aspect_ratio"]); face_count = face_analysis["count"]
     if face_count > 0 and face_analysis["closed_eye_count"] / face_count >= settings["closed_eye_percentage"]:
-        msg = "A person may have closed eyes."
+        msg = "Eyes Closed Detected: Please Review"
         return "Closed Eye", ClassificationDetails(has_closed_eyes=True, face_count=face_count, exposure=round(exposure, 2), message=msg)
     if face_count > 0:
         face_sharpness_scores = [calculate_sharpness(roi) for roi in face_analysis["face_rois"]]
@@ -198,7 +202,6 @@ async def update_history_label(request: UpdateHistoryLabelRequest):
         return {"message": "History label updated successfully"}
     except Exception as e: logger.error(f"DATABASE ERROR on update: {e}", exc_info=True); raise HTTPException(status_code=500, detail=f"Database Error: {str(e)}")
 
-# --- THE FIX IS HERE: RESTORED THE FULL WORKING LOGIC ---
 @app.get("/history", response_model=List[Dict])
 async def get_history():
     if not os.path.exists(DB_FILE): return []
@@ -209,11 +212,8 @@ async def get_history():
             return [dict(row) for row in rows]
     except Exception as e:
         logger.error(f"Could not retrieve history: {e}", exc_info=True)
-        # We must raise an exception here so FastAPI reports the error,
-        # otherwise it will return None and cause a validation error.
         raise HTTPException(status_code=500, detail="Failed to retrieve history from database.")
 
-# --- THE FIX IS HERE: RESTORED THE FULL WORKING LOGIC ---
 @app.delete("/history")
 async def clear_history():
     try:
